@@ -310,9 +310,13 @@ func groupByPackage(vulns []types.DetectedVulnerability) []pkgInfo {
 			pkgMap[key] = p
 		}
 		p.vulns = append(p.vulns, v)
-		// Keep the highest (lexicographically last) non-empty fixed version.
-		// In practice callers should deduplicate, but this is a safe fallback.
-		if v.FixedVersion != "" && v.FixedVersion > p.fixedVersion {
+		// Keep the first non-empty fixed version encountered.
+		// Advisory data typically contains a single fixed version per package;
+		// using a proper semantic version library (e.g. golang.org/x/mod/semver)
+		// would be more accurate but adds a dependency. For display purposes the
+		// first non-empty value is sufficient — the user should consult the
+		// primary URL for authoritative version information.
+		if v.FixedVersion != "" && p.fixedVersion == "" {
 			p.fixedVersion = v.FixedVersion
 		}
 	}

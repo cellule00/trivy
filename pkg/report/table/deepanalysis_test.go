@@ -17,10 +17,15 @@ import (
 
 // allSeverities returns a slice of all known severities for use in table.Options.
 func allSeverities() []dbTypes.Severity {
-	sevs := make([]dbTypes.Severity, len(dbTypes.SeverityNames))
-	for i, name := range dbTypes.SeverityNames {
-		s, _ := dbTypes.NewSeverity(name)
-		sevs[i] = s
+	sevs := make([]dbTypes.Severity, 0, len(dbTypes.SeverityNames))
+	for _, name := range dbTypes.SeverityNames {
+		s, err := dbTypes.NewSeverity(name)
+		if err != nil {
+			// SeverityNames is a package-level constant slice; any parse error here
+			// indicates a bug in the trivy-db package itself.
+			panic("unexpected unknown severity name: " + name)
+		}
+		sevs = append(sevs, s)
 	}
 	return sevs
 }
