@@ -126,6 +126,12 @@ var (
 		Values:     xstrings.ToStringSlice(types.SupportedTableModes),
 		Usage:      "[EXPERIMENTAL] tables that will be displayed in 'table' format",
 	}
+	ShowImpactFlag = Flag[bool]{
+		Name:       "show-impact",
+		ConfigName: "report.show-impact",
+		Default:    false,
+		Usage:      "show deep impact analysis: if-exploited consequences and will-fix remediation comparison for each vulnerability",
+	}
 )
 
 // ReportFlagGroup composes common printer flag structs
@@ -146,6 +152,7 @@ type ReportFlagGroup struct {
 	Compliance      *Flag[string]
 	ShowSuppressed  *Flag[bool]
 	TableMode       *Flag[[]string]
+	ShowImpact      *Flag[bool]
 }
 
 type ReportOptions struct {
@@ -164,6 +171,7 @@ type ReportOptions struct {
 	Compliance       spec.ComplianceSpec
 	ShowSuppressed   bool
 	TableModes       []types.TableMode
+	ShowImpact       bool
 }
 
 func NewReportFlagGroup() *ReportFlagGroup {
@@ -183,6 +191,7 @@ func NewReportFlagGroup() *ReportFlagGroup {
 		Compliance:      ComplianceFlag.Clone(),
 		ShowSuppressed:  ShowSuppressedFlag.Clone(),
 		TableMode:       TableModeFlag.Clone(),
+		ShowImpact:      ShowImpactFlag.Clone(),
 	}
 }
 
@@ -207,6 +216,7 @@ func (f *ReportFlagGroup) Flags() []Flagger {
 		f.Compliance,
 		f.ShowSuppressed,
 		f.TableMode,
+		f.ShowImpact,
 	}
 }
 
@@ -290,6 +300,7 @@ func (f *ReportFlagGroup) ToOptions(opts *Options) error {
 		Compliance:       cs,
 		ShowSuppressed:   f.ShowSuppressed.Value(),
 		TableModes:       xstrings.ToTSlice[types.TableMode](tableModes),
+		ShowImpact:       f.ShowImpact.Value(),
 	}
 	return nil
 }

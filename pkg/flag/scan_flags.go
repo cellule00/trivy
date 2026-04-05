@@ -135,6 +135,12 @@ var (
 		ConfigName: "scan.disable-telemetry",
 		Usage:      "disable sending anonymous usage data to Aqua",
 	}
+	DeepScanFlag = Flag[bool]{
+		Name:       "deep",
+		ConfigName: "scan.deep",
+		Default:    false,
+		Usage:      "enable deep scan mode: activates all scanners (vuln, misconfig, secret, license) with comprehensive detection priority",
+	}
 )
 
 type ScanFlagGroup struct {
@@ -151,6 +157,7 @@ type ScanFlagGroup struct {
 	DistroFlag        *Flag[string]
 	SkipVersionCheck  *Flag[bool]
 	DisableTelemetry  *Flag[bool]
+	Deep              *Flag[bool]
 }
 
 type ScanOptions struct {
@@ -167,6 +174,7 @@ type ScanOptions struct {
 	Distro            ftypes.OS
 	SkipVersionCheck  bool
 	DisableTelemetry  bool
+	Deep              bool
 }
 
 func NewScanFlagGroup() *ScanFlagGroup {
@@ -184,6 +192,7 @@ func NewScanFlagGroup() *ScanFlagGroup {
 		DistroFlag:        DistroFlag.Clone(),
 		SkipVersionCheck:  SkipVersionCheckFlag.Clone(),
 		DisableTelemetry:  DisableTelemetryFlag.Clone(),
+		Deep:              DeepScanFlag.Clone(),
 	}
 }
 
@@ -206,6 +215,7 @@ func (f *ScanFlagGroup) Flags() []Flagger {
 		f.DistroFlag,
 		f.SkipVersionCheck,
 		f.DisableTelemetry,
+		f.Deep,
 	}
 }
 
@@ -233,20 +243,37 @@ func (f *ScanFlagGroup) ToOptions(opts *Options) error {
 		}
 	}
 
+	deep := f.Deep.Value()
+
+	scanners := xstrings.ToTSlice[types.Scanner](f.Scanners.Value())
+	detectionPriority := ftypes.DetectionPriority(f.DetectionPriority.Value())
+
+	if deep {
+		// Deep mode: enable all scanners and use comprehensive detection
+		scanners = types.Scanners{
+			types.VulnerabilityScanner,
+			types.MisconfigScanner,
+			types.SecretScanner,
+			types.LicenseScanner,
+		}
+		detectionPriority = ftypes.PriorityComprehensive
+	}
+
 	opts.ScanOptions = ScanOptions{
 		Target:            target,
 		SkipDirs:          f.SkipDirs.Value(),
 		SkipFiles:         f.SkipFiles.Value(),
 		OfflineScan:       f.OfflineScan.Value(),
-		Scanners:          xstrings.ToTSlice[types.Scanner](f.Scanners.Value()),
+		Scanners:          scanners,
 		FilePatterns:      f.FilePatterns.Value(),
 		Parallel:          parallel,
 		SBOMSources:       f.SBOMSources.Value(),
 		RekorURL:          f.RekorURL.Value(),
-		DetectionPriority: ftypes.DetectionPriority(f.DetectionPriority.Value()),
+		DetectionPriority: detectionPriority,
 		Distro:            distro,
 		SkipVersionCheck:  f.SkipVersionCheck.Value(),
 		DisableTelemetry:  f.DisableTelemetry.Value(),
+		Deep:              deep,
 	}
 	return nil
 }

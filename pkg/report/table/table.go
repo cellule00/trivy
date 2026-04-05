@@ -40,6 +40,7 @@ type Writer struct {
 	secretRenderer        Renderer
 	pkgLicenseRenderer    Renderer
 	fileLicenseRenderer   Renderer
+	deepAnalysisRenderer  *DeepAnalysisRenderer
 
 	options Options
 }
@@ -58,6 +59,9 @@ type Options struct {
 	// Show/hide summary/detailed tables
 	TableModes []types.TableMode
 
+	// Show deep impact analysis (if-exploited + will-fix comparison)
+	ShowImpact bool
+
 	// For misconfigurations
 	IncludeNonFailures bool
 	Trace              bool
@@ -71,6 +75,12 @@ type Options struct {
 func NewWriter(options Options) *Writer {
 	buf := bytes.NewBuffer([]byte{})
 	isTerminal := IsOutputToTerminal(options.Output)
+
+	var deepRenderer *DeepAnalysisRenderer
+	if options.ShowImpact {
+		deepRenderer = NewDeepAnalysisRenderer(buf, isTerminal)
+	}
+
 	return &Writer{
 		buf: buf,
 
@@ -80,6 +90,7 @@ func NewWriter(options Options) *Writer {
 		secretRenderer:        NewSecretRenderer(buf, isTerminal, options.Severities),
 		pkgLicenseRenderer:    NewPkgLicenseRenderer(buf, isTerminal, options.Severities),
 		fileLicenseRenderer:   NewFileLicenseRenderer(buf, isTerminal, options.Severities),
+		deepAnalysisRenderer:  deepRenderer,
 		options:               options,
 	}
 }
@@ -102,6 +113,11 @@ func (tw *Writer) Write(_ context.Context, report types.Report) error {
 			}
 			tw.render(result)
 		}
+	}
+
+	// Render deep impact analysis after standard tables when enabled
+	if tw.deepAnalysisRenderer != nil {
+		tw.deepAnalysisRenderer.RenderReport(report)
 	}
 
 	tw.flush()

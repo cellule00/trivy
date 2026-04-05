@@ -445,6 +445,11 @@ func (o *Options) Align(f *Flags) error {
 		o.enableSBOM()
 	}
 
+	// Deep mode automatically activates impact analysis output
+	if o.Deep {
+		o.ShowImpact = true
+	}
+
 	if packageFlagGroup, ok := findFlagGroup[*PackageFlagGroup](f); ok &&
 		packageFlagGroup.PkgRelationships != nil &&
 		slices.Compare(o.PkgRelationships, ftypes.Relationships) != 0 &&
