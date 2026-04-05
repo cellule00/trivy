@@ -45,6 +45,24 @@ func makeVuln(cveID, pkg, installed, fixed, severity, cvssV3 string) types.Detec
 	return vuln
 }
 
+// makeVulnWithScore builds a DetectedVulnerability with a CVSS v3 vector AND numeric score.
+func makeVulnWithScore(cveID, pkg, installed, fixed, severity, cvssV3 string, v3Score float64) types.DetectedVulnerability {
+	vuln := types.DetectedVulnerability{
+		VulnerabilityID:  cveID,
+		PkgName:          pkg,
+		InstalledVersion: installed,
+		FixedVersion:     fixed,
+	}
+	vuln.Severity = severity
+	if cvssV3 != "" {
+		vuln.CVSS = dbTypes.VendorCVSS{
+			"nvd": dbTypes.CVSS{V3Vector: cvssV3, V3Score: v3Score},
+		}
+	}
+	return vuln
+}
+
+
 // ─────────────────────────────────────────────────────────────────
 // ParseCVSSImpact tests
 // ─────────────────────────────────────────────────────────────────
@@ -214,6 +232,162 @@ func TestCheckModule_ScopeChanged(t *testing.T) {
 	m.RenderCheck(result)
 	out := buf.String()
 	assert.Contains(t, out, "Changed (other components affected)")
+}
+
+// BUG-1 regression: privilegesLabel used to return "Unknown" when no auth field
+// was present, causing impact strings to be incorrectly prefixed with "[Unknown]".
+func TestCheckModule_NoPrivilegesField_NoBracketUnknownPrefix(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	// Vector has no PR and no Au field at all — edge case (e.g. incomplete data)
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			// Manually construct a vuln with a raw partial vector via empty CVSS map
+			{
+				VulnerabilityID:  "CVE-2099-0001",
+				PkgName:          "pkg",
+				InstalledVersion: "1.0",
+				// No CVSS entry at all → bestCVSSVector returns "" → privilegesLabel("") = ""
+			},
+		},
+	}
+	m.RenderCheck(result)
+	out := buf.String()
+	assert.NotContains(t, out, "[Unknown]", "impact must not have [Unknown] prefix when no auth info is available")
+}
+
+// BUG-2 regression: CVSS v2 AC:M should produce "Medium" not "Unknown".
+func TestExploitLikelihood_CVSSv2MediumComplexity(t *testing.T) {
+	// CVSS v2: AC:M — medium complexity; network, no auth → should be MEDIUM
+	l := table.ExploitLikelihood("AV:N/AC:M/Au:N/C:P/I:P/A:P")
+	// AC:M in v2 is not Low, so falls into MEDIUM bucket
+	assert.Equal(t, "MEDIUM", l)
+}
+
+func TestCheckModule_AttackComplexityMedium(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			{
+				VulnerabilityID:  "CVE-2005-0001",
+				PkgName:          "oldlib",
+				InstalledVersion: "1.0",
+				Vulnerability: dbTypes.Vulnerability{
+					Severity: "MEDIUM",
+					CVSS: dbTypes.VendorCVSS{
+						"nvd": dbTypes.CVSS{V2Vector: "AV:N/AC:M/Au:N/C:P/I:P/A:P"},
+					},
+				},
+			},
+		},
+	}
+	m.RenderCheck(result)
+	out := buf.String()
+	assert.Contains(t, out, "Medium (some conditions required)", "CVSS v2 AC:M should render as Medium")
+	assert.NotContains(t, out, "Unknown", "AC:M must not fall through to Unknown")
+}
+
+// BUG-3 regression: bestCVSSVector must be deterministic when multiple vendors
+// provide v3 vectors. It should prefer NVD and otherwise pick the highest score.
+func TestCheckModule_BestCVSSVector_PrefersNVD(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+
+	// NVD has a network (high-severity) vector; RHEL has a local (low-severity) one.
+	// The output must consistently reflect the NVD vector (Network).
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			{
+				VulnerabilityID:  "CVE-2024-0001",
+				PkgName:          "multivendor",
+				InstalledVersion: "1.0",
+				Vulnerability: dbTypes.Vulnerability{
+					Severity: "CRITICAL",
+					CVSS: dbTypes.VendorCVSS{
+						"nvd":  dbTypes.CVSS{V3Vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", V3Score: 9.8},
+						"rhel": dbTypes.CVSS{V3Vector: "CVSS:3.1/AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H", V3Score: 7.8},
+					},
+				},
+			},
+		},
+	}
+
+	// Run 20 times to surface any non-determinism from map iteration.
+	for i := 0; i < 20; i++ {
+		buf.Reset()
+		m.RenderCheck(result)
+		out := buf.String()
+		assert.Contains(t, out, "Network", "must always pick NVD (Network) vector, not RHEL (Local)")
+		assert.NotContains(t, out, "Local (requires local access", "RHEL local vector must never win over NVD")
+	}
+}
+
+func TestCheckModule_BestCVSSVector_HighestScoreWinsWhenNoNVD(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+
+	// No NVD entry; two vendors — pick the one with the higher score.
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			{
+				VulnerabilityID:  "CVE-2024-0002",
+				PkgName:          "pkg",
+				InstalledVersion: "1.0",
+				Vulnerability: dbTypes.Vulnerability{
+					Severity: "HIGH",
+					CVSS: dbTypes.VendorCVSS{
+						"vendor-a": dbTypes.CVSS{V3Vector: "CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", V3Score: 8.4},
+						"vendor-b": dbTypes.CVSS{V3Vector: "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", V3Score: 9.8},
+					},
+				},
+			},
+		},
+	}
+
+	for i := 0; i < 20; i++ {
+		buf.Reset()
+		m.RenderCheck(result)
+		out := buf.String()
+		assert.Contains(t, out, "Network", "highest-score vector (vendor-b, AV:N) must always win")
+	}
+}
+
+// BUG-4: CVSS Score column should appear in Exploit Surface table.
+func TestCheckModule_CVSSScoreColumn_Present(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			makeVulnWithScore("CVE-2023-1234", "openssl", "1.0", "1.1", "CRITICAL",
+				"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H", 9.8),
+		},
+	}
+	m.RenderCheck(result)
+	out := buf.String()
+	assert.Contains(t, out, "CVSS Score", "Exploit Surface table must have CVSS Score column header")
+	assert.Contains(t, out, "9.8 (v3)", "NVD v3 score must appear in table")
+}
+
+func TestCheckModule_CVSSScoreColumn_NoScore_ShowsNA(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			// No CVSS at all
+			{VulnerabilityID: "CVE-2023-0000", PkgName: "pkg"},
+		},
+	}
+	m.RenderCheck(result)
+	out := buf.String()
+	assert.Contains(t, out, "CVSS Score")
+	assert.Contains(t, out, "N/A", "missing score should display N/A")
 }
 
 // ─────────────────────────────────────────────────────────────────

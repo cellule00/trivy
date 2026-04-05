@@ -17,10 +17,12 @@ package table
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/fatih/color"
 
+	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
 
@@ -61,6 +63,7 @@ func (m *CheckModule) renderExploitSurface(result types.Result) {
 		"CVE ID",
 		"Package",
 		"Severity",
+		"CVSS Score",
 		"Attack Vector",
 		"Complexity",
 		"Auth / Privileges",
@@ -87,7 +90,9 @@ func (m *CheckModule) renderExploitSurface(result types.Result) {
 			sev = ColorizeSeverity(v.Severity, v.Severity)
 		}
 
-		tw.AddRow(v.VulnerabilityID, v.PkgName, sev, av, ac, pr, ui, likelihood)
+		score := cvssScoreLabel(v)
+
+		tw.AddRow(v.VulnerabilityID, v.PkgName, sev, score, av, ac, pr, ui, likelihood)
 	}
 
 	tw.Render()
@@ -256,25 +261,71 @@ func ExploitLikelihood(vector string) string {
 // Shared CVSS helpers — used by both CheckModule and FixModule
 // ─────────────────────────────────────────────────────────────────
 
-// bestCVSSVector returns the most descriptive CVSS vector for a vulnerability,
-// preferring v3 → v4 → v2.
+// bestCVSSVector returns the most descriptive CVSS vector for a vulnerability.
+//
+// Selection strategy (security-conservative — always picks the worst-case risk):
+//  1. Prefer the NVD vendor's v3 vector when present, as it is the canonical source.
+//  2. If NVD has no v3, scan all vendors and pick the v3 vector with the highest score.
+//  3. Fall back to v4 vectors using the same highest-score heuristic.
+//  4. Fall back to v2 vectors using the same highest-score heuristic.
+//
+// This ensures the output is deterministic regardless of Go map-iteration order and
+// that the displayed data represents the worst-case (most dangerous) interpretation,
+// which is the safest posture for a vulnerability scanner.
 func bestCVSSVector(v types.DetectedVulnerability) string {
-	for _, cvss := range v.CVSS {
-		if cvss.V3Vector != "" {
-			return cvss.V3Vector
-		}
+	// 1. Canonical NVD v3
+	if nvd, ok := v.CVSS["nvd"]; ok && nvd.V3Vector != "" {
+		return nvd.V3Vector
 	}
-	for _, cvss := range v.CVSS {
-		if cvss.V40Vector != "" {
-			return cvss.V40Vector
-		}
+
+	// 2. Highest v3 score across all vendors
+	if vec := highestScoredVector(v, func(c dbTypes.CVSS) (string, float64) {
+		return c.V3Vector, c.V3Score
+	}); vec != "" {
+		return vec
 	}
-	for _, cvss := range v.CVSS {
-		if cvss.V2Vector != "" {
-			return cvss.V2Vector
-		}
+
+	// 3. Highest v4 score across all vendors
+	if vec := highestScoredVector(v, func(c dbTypes.CVSS) (string, float64) {
+		return c.V40Vector, c.V40Score
+	}); vec != "" {
+		return vec
 	}
+
+	// 4. Highest v2 score across all vendors
+	if vec := highestScoredVector(v, func(c dbTypes.CVSS) (string, float64) {
+		return c.V2Vector, c.V2Score
+	}); vec != "" {
+		return vec
+	}
+
 	return ""
+}
+
+// highestScoredVector iterates the VendorCVSS map in a deterministic (sorted-key)
+// order and returns the vector string from the entry with the highest numeric score.
+// The accessor function extracts the (vector, score) pair for the desired CVSS version.
+func highestScoredVector(
+	v types.DetectedVulnerability,
+	accessor func(dbTypes.CVSS) (string, float64),
+) string {
+	// Collect vendor keys so iteration is deterministic.
+	keys := make([]dbTypes.SourceID, 0, len(v.CVSS))
+	for k := range v.CVSS {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	best := ""
+	bestScore := -1.0
+	for _, k := range keys {
+		vec, score := accessor(v.CVSS[k])
+		if vec != "" && score > bestScore {
+			best = vec
+			bestScore = score
+		}
+	}
+	return best
 }
 
 // parseMetrics splits "AV:N/AC:L/PR:N/…" into map[key]value.
@@ -321,6 +372,8 @@ func attackComplexityLabel(ac string) string {
 	switch ac {
 	case "L":
 		return "Low (no special conditions)"
+	case "M":
+		return "Medium (some conditions required)" // CVSS v2 only
 	case "H":
 		return "High (specific conditions required)"
 	default:
@@ -329,6 +382,9 @@ func attackComplexityLabel(ac string) string {
 }
 
 // privilegesLabel handles both CVSS v3 (PR) and v2 (Au).
+// Returns an empty string when no authentication information is present so that
+// callers can omit the privilege qualifier rather than printing a misleading
+// "[Unknown]" prefix.
 func privilegesLabel(met map[string]string) string {
 	switch met["PR"] {
 	case "N":
@@ -347,7 +403,7 @@ func privilegesLabel(met map[string]string) string {
 	case "M":
 		return "multiple authentications required"
 	}
-	return "Unknown"
+	return ""
 }
 
 func userInteractionLabel(ui string) string {
@@ -398,4 +454,49 @@ func colorizeExploitLikelihood(likelihood string) string {
 	default:
 		return color.New(color.FgCyan).Sprint(likelihood)
 	}
+}
+
+// cvssScoreLabel returns a human-readable CVSS score string for a vulnerability,
+// e.g. "9.8 (v3)" or "7.5 (v2)". Returns "N/A" when no numeric score is available.
+//
+// Version preference mirrors bestCVSSVector: NVD v3 → highest v3 → highest v4 → highest v2.
+func cvssScoreLabel(v types.DetectedVulnerability) string {
+	// NVD v3 canonical
+	if nvd, ok := v.CVSS["nvd"]; ok && nvd.V3Score > 0 {
+		return fmt.Sprintf("%.1f (v3)", nvd.V3Score)
+	}
+	// Highest v3 across all vendors
+	if score := highestNumericScore(v, func(c dbTypes.CVSS) float64 { return c.V3Score }); score > 0 {
+		return fmt.Sprintf("%.1f (v3)", score)
+	}
+	// Highest v4
+	if score := highestNumericScore(v, func(c dbTypes.CVSS) float64 { return c.V40Score }); score > 0 {
+		return fmt.Sprintf("%.1f (v4)", score)
+	}
+	// Highest v2
+	if score := highestNumericScore(v, func(c dbTypes.CVSS) float64 { return c.V2Score }); score > 0 {
+		return fmt.Sprintf("%.1f (v2)", score)
+	}
+	return "N/A"
+}
+
+// highestNumericScore returns the maximum score returned by accessor across all
+// vendors, iterating in deterministic (sorted-key) order.
+func highestNumericScore(
+	v types.DetectedVulnerability,
+	accessor func(dbTypes.CVSS) float64,
+) float64 {
+	keys := make([]dbTypes.SourceID, 0, len(v.CVSS))
+	for k := range v.CVSS {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+
+	best := 0.0
+	for _, k := range keys {
+		if s := accessor(v.CVSS[k]); s > best {
+			best = s
+		}
+	}
+	return best
 }
