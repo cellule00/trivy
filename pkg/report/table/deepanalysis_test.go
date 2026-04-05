@@ -17,34 +17,32 @@ import (
 
 // allSeverities returns a slice of all known severities for use in table.Options.
 func allSeverities() []dbTypes.Severity {
-	sevs := make([]dbTypes.Severity, 0, len(dbTypes.SeverityNames))
+	severities := make([]dbTypes.Severity, 0, len(dbTypes.SeverityNames))
 	for _, name := range dbTypes.SeverityNames {
 		s, err := dbTypes.NewSeverity(name)
 		if err != nil {
-			// SeverityNames is a package-level constant slice; any parse error here
-			// indicates a bug in the trivy-db package itself.
 			panic("unexpected unknown severity name: " + name)
 		}
-		sevs = append(sevs, s)
+		severities = append(severities, s)
 	}
-	return sevs
+	return severities
 }
 
 // makeVuln is a helper to build a DetectedVulnerability with a CVSS v3 vector.
 func makeVuln(cveID, pkg, installed, fixed, severity, cvssV3 string) types.DetectedVulnerability {
-	v := types.DetectedVulnerability{
+	vuln := types.DetectedVulnerability{
 		VulnerabilityID:  cveID,
 		PkgName:          pkg,
 		InstalledVersion: installed,
 		FixedVersion:     fixed,
 	}
-	v.Severity = severity
+	vuln.Severity = severity
 	if cvssV3 != "" {
-		v.CVSS = dbTypes.VendorCVSS{
+		vuln.CVSS = dbTypes.VendorCVSS{
 			"nvd": dbTypes.CVSS{V3Vector: cvssV3},
 		}
 	}
-	return v
+	return vuln
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -94,14 +92,177 @@ func TestParseCVSSImpact_CVSSv2(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// ExploitLikelihood tests
+// ─────────────────────────────────────────────────────────────────
+
+func TestExploitLikelihood_Critical(t *testing.T) {
+	// Network, low complexity, no privileges, no user interaction → CRITICAL
+	l := table.ExploitLikelihood("CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+	assert.Equal(t, "CRITICAL", l)
+}
+
+func TestExploitLikelihood_HighNoUserInteraction(t *testing.T) {
+	// Network, low complexity, low privileges, no UI → HIGH
+	l := table.ExploitLikelihood("CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N")
+	assert.Equal(t, "HIGH", l)
+}
+
+func TestExploitLikelihood_HighUserRequired(t *testing.T) {
+	// Network, low complexity, no privileges, but needs user click → HIGH
+	l := table.ExploitLikelihood("CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:N/A:N")
+	assert.Equal(t, "HIGH", l)
+}
+
+func TestExploitLikelihood_HighComplexNoAuth(t *testing.T) {
+	// Network, HIGH complexity but no auth + no UI → HIGH
+	l := table.ExploitLikelihood("CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:H/I:N/A:N")
+	assert.Equal(t, "HIGH", l)
+}
+
+func TestExploitLikelihood_MediumNetworkRestricted(t *testing.T) {
+	// Network, but high complexity AND requires privileges → MEDIUM
+	l := table.ExploitLikelihood("CVSS:3.1/AV:N/AC:H/PR:H/UI:R/S:U/C:L/I:N/A:N")
+	assert.Equal(t, "MEDIUM", l)
+}
+
+func TestExploitLikelihood_MediumAdjacent(t *testing.T) {
+	l := table.ExploitLikelihood("CVSS:3.1/AV:A/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+	assert.Equal(t, "MEDIUM", l)
+}
+
+func TestExploitLikelihood_LowLocal(t *testing.T) {
+	l := table.ExploitLikelihood("CVSS:3.1/AV:L/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+	assert.Equal(t, "LOW", l)
+}
+
+func TestExploitLikelihood_LowPhysical(t *testing.T) {
+	l := table.ExploitLikelihood("CVSS:3.1/AV:P/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H")
+	assert.Equal(t, "LOW", l)
+}
+
+func TestExploitLikelihood_UnknownEmptyVector(t *testing.T) {
+	l := table.ExploitLikelihood("")
+	assert.Equal(t, "UNKNOWN", l)
+}
+
+func TestExploitLikelihood_CVSSv2NoAuth(t *testing.T) {
+	// CVSS v2: Au:N maps to no-privileges → network no-auth should be CRITICAL
+	l := table.ExploitLikelihood("AV:N/AC:L/Au:N/C:C/I:C/A:C")
+	assert.Equal(t, "CRITICAL", l)
+}
+
+// ─────────────────────────────────────────────────────────────────
+// CheckModule tests
+// ─────────────────────────────────────────────────────────────────
+
+func TestCheckModule_RendersExploitSurfaceAndImpact(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+
+	result := types.Result{
+		Target: "test-image (debian 11)",
+		Class:  types.ClassOSPkg,
+		Vulnerabilities: []types.DetectedVulnerability{
+			makeVuln("CVE-2021-0001", "libfoo", "1.0.0", "1.0.1", "CRITICAL",
+				"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"),
+		},
+	}
+
+	m.RenderCheck(result)
+	out := buf.String()
+
+	// Exploit Surface table
+	assert.Contains(t, out, "CHECK — Exploit Surface")
+	assert.Contains(t, out, "Attack Vector")
+	assert.Contains(t, out, "Complexity")
+	assert.Contains(t, out, "Auth / Privileges")
+	assert.Contains(t, out, "User Interaction")
+	assert.Contains(t, out, "Exploit Likelihood")
+	assert.Contains(t, out, "CRITICAL")
+	assert.Contains(t, out, "Network")
+	assert.Contains(t, out, "no authentication required")
+	assert.Contains(t, out, "None (no user action needed)")
+
+	// Impact Assessment table
+	assert.Contains(t, out, "CHECK — Impact Assessment")
+	assert.Contains(t, out, "Confidentiality")
+	assert.Contains(t, out, "Integrity")
+	assert.Contains(t, out, "Availability")
+	assert.Contains(t, out, "Scope")
+	assert.Contains(t, out, "WILL Result In")
+	assert.Contains(t, out, "High") // C/I/A columns
+	assert.Contains(t, out, "Unchanged")
+}
+
+func TestCheckModule_NoVulnerabilities_NoOutput(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	m.RenderCheck(types.Result{Target: "empty", Class: types.ClassOSPkg})
+	assert.Empty(t, buf.String())
+}
+
+func TestCheckModule_ScopeChanged(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewCheckModule(buf, false)
+	result := types.Result{
+		Target: "test",
+		Vulnerabilities: []types.DetectedVulnerability{
+			makeVuln("CVE-2022-1111", "lib", "1.0", "2.0", "HIGH",
+				"CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H"),
+		},
+	}
+	m.RenderCheck(result)
+	out := buf.String()
+	assert.Contains(t, out, "Changed (other components affected)")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// FixModule tests
+// ─────────────────────────────────────────────────────────────────
+
+func TestFixModule_RendersRemediationComparison(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewFixModule(buf, false)
+
+	result := types.Result{
+		Target: "test (alpine 3.16)",
+		Class:  types.ClassOSPkg,
+		Vulnerabilities: []types.DetectedVulnerability{
+			makeVuln("CVE-2021-0001", "libfoo", "1.0.0", "1.0.1", "CRITICAL", ""),
+			makeVuln("CVE-2021-0002", "libfoo", "1.0.0", "1.0.1", "HIGH", ""),
+			makeVuln("CVE-2021-0003", "libbar", "2.0.0", "", "MEDIUM", ""),
+		},
+	}
+
+	m.RenderFix(result)
+	out := buf.String()
+
+	assert.Contains(t, out, "FIX — Remediation Comparison")
+	assert.Contains(t, out, "libfoo")
+	assert.Contains(t, out, "Upgrade to libfoo@1.0.1")
+	assert.Contains(t, out, "CVE-2021-0001")
+	assert.Contains(t, out, "CVE-2021-0002")
+	assert.Contains(t, out, "No fix available")
+	assert.Contains(t, out, "CVE-2021-0003")
+	assert.Contains(t, out, "Upgrading")
+	assert.Contains(t, out, "vulnerabilities")
+}
+
+func TestFixModule_NoVulnerabilities_NoOutput(t *testing.T) {
+	buf := &bytes.Buffer{}
+	m := table.NewFixModule(buf, false)
+	m.RenderFix(types.Result{Target: "empty", Class: types.ClassOSPkg})
+	assert.Empty(t, buf.String())
+}
+
+// ─────────────────────────────────────────────────────────────────
 // DeepAnalysisRenderer integration tests
 // ─────────────────────────────────────────────────────────────────
 
-func TestDeepAnalysisRenderer_ImpactAndRemediation(t *testing.T) {
+func TestDeepAnalysisRenderer_CheckAndFix(t *testing.T) {
 	buf := &bytes.Buffer{}
 	renderer := table.NewDeepAnalysisRenderer(buf, false /* not terminal */)
 
-	now := time.Now()
 	report := types.Report{
 		ArtifactName: "test-image:latest",
 		Results: types.Results{
@@ -118,20 +279,21 @@ func TestDeepAnalysisRenderer_ImpactAndRemediation(t *testing.T) {
 				},
 			},
 		},
-		CreatedAt: now,
+		CreatedAt: time.Time{},
 	}
 
 	renderer.RenderReport(report)
 	output := buf.String()
 
-	// Impact Analysis block
-	assert.Contains(t, output, "Deep Impact Analysis")
+	// CHECK module blocks
+	assert.Contains(t, output, "CHECK — Exploit Surface")
+	assert.Contains(t, output, "CHECK — Impact Assessment")
 	assert.Contains(t, output, "CVE-2021-0001")
 	assert.Contains(t, output, "Network")
 	assert.Contains(t, output, "confidentiality breach")
 
-	// Remediation Comparison block
-	assert.Contains(t, output, "Remediation Comparison")
+	// FIX module block
+	assert.Contains(t, output, "FIX — Remediation Comparison")
 	assert.Contains(t, output, "libfoo")
 	assert.Contains(t, output, "1.0.0")
 	assert.Contains(t, output, "Upgrade to libfoo@1.0.1")
@@ -162,7 +324,6 @@ func TestDeepAnalysisRenderer_NoVulnerabilities(t *testing.T) {
 	}
 
 	renderer.RenderReport(report)
-	// Nothing should be written when there are no vulnerabilities
 	assert.Empty(t, buf.String())
 }
 
@@ -196,8 +357,10 @@ func TestDeepAnalysisRenderer_MultipleResults(t *testing.T) {
 
 	assert.Contains(t, output, "os-packages")
 	assert.Contains(t, output, "python")
-	assert.Equal(t, 2, strings.Count(output, "Deep Impact Analysis"))
-	assert.Equal(t, 2, strings.Count(output, "Remediation Comparison"))
+	// Each result gets a CHECK Exploit Surface + CHECK Impact Assessment + FIX Remediation → 3 sections per result
+	assert.Equal(t, 2, strings.Count(output, "CHECK — Exploit Surface"))
+	assert.Equal(t, 2, strings.Count(output, "CHECK — Impact Assessment"))
+	assert.Equal(t, 2, strings.Count(output, "FIX — Remediation Comparison"))
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -232,8 +395,9 @@ func TestTableWriter_ShowImpact_Enabled(t *testing.T) {
 	require.NoError(t, err)
 
 	output := buf.String()
-	assert.Contains(t, output, "Deep Impact Analysis")
-	assert.Contains(t, output, "Remediation Comparison")
+	assert.Contains(t, output, "CHECK — Exploit Surface")
+	assert.Contains(t, output, "CHECK — Impact Assessment")
+	assert.Contains(t, output, "FIX — Remediation Comparison")
 }
 
 func TestTableWriter_ShowImpact_Disabled(t *testing.T) {
@@ -264,6 +428,7 @@ func TestTableWriter_ShowImpact_Disabled(t *testing.T) {
 	require.NoError(t, err)
 
 	output := buf.String()
-	assert.NotContains(t, output, "Deep Impact Analysis")
-	assert.NotContains(t, output, "Remediation Comparison")
+	assert.NotContains(t, output, "CHECK — Exploit Surface")
+	assert.NotContains(t, output, "CHECK — Impact Assessment")
+	assert.NotContains(t, output, "FIX — Remediation Comparison")
 }
